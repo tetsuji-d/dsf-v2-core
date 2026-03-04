@@ -303,28 +303,43 @@
   uniform vec3      u_color;
   uniform vec3      u_glow;
   uniform float     u_time;
+  // u_screenPx: atlas size in pixels / glyph quad size in physical screen pixels
+  // → converts 1 atlas-texel to screen-space UV, used for fallback AA width
+  uniform float     u_screenPx;
 
   float median(float r, float g, float b) { return max(min(r,g), min(max(r,g),b)); }
 
   void main() {
-    vec3  msd  = texture2D(u_atlas, v_uv).rgb;
-    float sd   = median(msd.r, msd.g, msd.b);
+    vec3 msd = texture2D(u_atlas, v_uv).rgb;
 
-    // Anti-aliased edge width
+    // ── fwidth-based anti-aliasing ────────────────────────────────────
+    // Compute screen-space gradient magnitude for each channel separately,
+    // then take the median.  This is more accurate than fwidth(median)
+    // because it avoids gradient cancellation across the triange boundary.
     #ifdef GL_OES_standard_derivatives
-      float w = fwidth(sd) * .75;
+      // Per-channel gradient magnitude (screen pixels per SDF unit)
+      float dR = length(vec2(dFdx(msd.r), dFdy(msd.r)));
+      float dG = length(vec2(dFdx(msd.g), dFdy(msd.g)));
+      float dB = length(vec2(dFdx(msd.b), dFdy(msd.b)));
+      // Use median of gradients for robustness against single-channel noise
+      float screenPxRange = median(dR, dG, dB);
+      // Guard: if derivative is ~0 (e.g., magnified far beyond atlas res),
+      // fall back to atlas-pixel-size-based width
+      screenPxRange = max(screenPxRange, u_screenPx);
+      float w = screenPxRange * 0.5;
     #else
-      float w = 0.018;
+      float w = u_screenPx * 0.5;
     #endif
 
-    float alpha = smoothstep(.5 - w, .5 + w, sd);
+    float sd    = median(msd.r, msd.g, msd.b);
+    float alpha = smoothstep(0.5 - w, 0.5 + w, sd);
 
-    // Outer glow halo
-    float halo = smoothstep(.30, .50, sd) * (1. - alpha) * .55;
+    // Outer glow halo (soft shell just outside edge)
+    float halo = smoothstep(0.30, 0.50, sd) * (1.0 - alpha) * 0.55;
 
     // Animated inner shimmer
-    float shimmer = .5 + .5 * sin(u_time * 2.1 + v_uv.x * 8.);
-    vec3  innerCol = mix(u_color, vec3(1.), shimmer * .25);
+    float shimmer  = 0.5 + 0.5 * sin(u_time * 2.1 + v_uv.x * 8.0);
+    vec3  innerCol = mix(u_color, vec3(1.0), shimmer * 0.25);
 
     vec3  finalCol = mix(u_glow, innerCol, alpha);
     float finalA   = alpha + halo;
@@ -441,6 +456,33 @@
         }
 
         // ═══════════════════════════════════════════════════════════════
+        // devicePixelRatio — resize canvas to physical pixel dimensions
+        // ═══════════════════════════════════════════════════════════════
+        // Logical size of the DSF canvas (design space)
+        const CANVAS_W = 1080;
+        const CANVAS_H = 1920;
+
+        // Physical pixel dimensions, updated on resize
+        let physW = CANVAS_W;
+        let physH = CANVAS_H;
+
+        function resizeCanvas() {
+            const dpr = window.devicePixelRatio || 1;
+            physW = Math.round(CANVAS_W * dpr);
+            physH = Math.round(CANVAS_H * dpr);
+            // Set backing-store size to physical pixels
+            canvas.width = physW;
+            canvas.height = physH;
+            // CSS size stays fixed (driven by .canvas-wrap aspect-ratio)
+            // so WebGL renders into a larger buffer that the browser downsamples → sharper
+            console.log(`[DPR] ${dpr}x → canvas backing store: ${physW}×${physH}`);
+        }
+        resizeCanvas();
+        // Re-apply if DPR changes (e.g., moving window between monitors)
+        window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+            .addEventListener('change', resizeCanvas);
+
+        // ═══════════════════════════════════════════════════════════════
         // Main async init
         // ═══════════════════════════════════════════════════════════════
         async function main() {
@@ -457,7 +499,7 @@
 
             // 2. Generate MSDF atlas (CPU)
             loadMsg.textContent = 'Generating MSDF atlas…';
-            await new Promise(r => setTimeout(r, 0));   // yield to browser to repaint spinner
+            await new Promise(r => setTimeout(r, 0));   // yield → repaint spinner
             const fontSpec = `bold ${font.size}px ${font.family}`;
             const atlasRGBA = generateMSDFAtlas(dispChar, fontSpec, atlas.width, atlas.height, font.spread);
 
@@ -474,10 +516,10 @@
             gl.bindBuffer(gl.ARRAY_BUFFER, bgVBO);
             gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
 
-            // ── Glyph geometry ────────────────────────────────────────
+            // ── Glyph geometry (built in logical 1080×1920 space) ─────
             const glyphVBO = gl.createBuffer();
             gl.bindBuffer(gl.ARRAY_BUFFER, glyphVBO);
-            gl.bufferData(gl.ARRAY_BUFFER, buildGlyphQuad(1080, 1920, dispScale), gl.STATIC_DRAW);
+            gl.bufferData(gl.ARRAY_BUFFER, buildGlyphQuad(CANVAS_W, CANVAS_H, dispScale), gl.STATIC_DRAW);
 
             // ── Uniform locations ─────────────────────────────────────
             const bg = {
@@ -494,6 +536,7 @@
                 uColor: gl.getUniformLocation(glyphProg, 'u_color'),
                 uGlow: gl.getUniformLocation(glyphProg, 'u_glow'),
                 uTime: gl.getUniformLocation(glyphProg, 'u_time'),
+                uScreenPx: gl.getUniformLocation(glyphProg, 'u_screenPx'),
             };
 
             // Hide loading overlay
@@ -505,21 +548,25 @@
 
             function render(now) {
                 const t = now * 0.001;
-                gl.viewport(0, 0, 1080, 1920);
+                const dpr = window.devicePixelRatio || 1;
 
-                // Pass 1: background rings
+                // Physical pixel dimensions may have changed (DPR change or first frame)
+                gl.viewport(0, 0, physW, physH);
+
+                // ── Pass 1: background rings ───────────────────────────
                 gl.disable(gl.BLEND);
                 gl.useProgram(bg.prog);
                 gl.bindBuffer(gl.ARRAY_BUFFER, bgVBO);
                 gl.enableVertexAttribArray(bg.aPos);
                 gl.vertexAttribPointer(bg.aPos, 2, gl.FLOAT, false, 0, 0);
                 gl.uniform1f(bg.uTime, t);
-                gl.uniform2f(bg.uRes, 1080, 1920);
+                // Pass logical resolution so the ring-field math stays consistent
+                gl.uniform2f(bg.uRes, CANVAS_W, CANVAS_H);
                 gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-                // Pass 2: MSDF character
+                // ── Pass 2: MSDF character ─────────────────────────────
                 gl.enable(gl.BLEND);
-                gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // premultiplied alpha
+                gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);  // premultiplied alpha
                 gl.useProgram(gh.prog);
                 gl.bindBuffer(gl.ARRAY_BUFFER, glyphVBO);
                 gl.enableVertexAttribArray(gh.aPos);
@@ -532,14 +579,28 @@
                 gl.uniform3fv(gh.uColor, dispColor);
                 gl.uniform3fv(gh.uGlow, dispGlow);
                 gl.uniform1f(gh.uTime, t);
+
+                // u_screenPx: the SDF gradient of 1 atlas texel in [0,1] UV space
+                // = 1/atlasSize in UV, converted to screen px by atlas-px/screen-px ratio
+                // Glyph quad occupies (dispScale * physH) physical pixels in height,
+                // and the atlas is atlas.height texels tall → ratio = atlasH / glyphPhysH
+                const glyphPhysH = dispScale * physH;
+                const screenPx = atlas.height / glyphPhysH;  // atlas px per screen px (UV units)
+                gl.uniform1f(gh.uScreenPx, screenPx);
+
                 gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-                // Stats
+                // ── Stats ──────────────────────────────────────────────
                 frames++;
                 if (now - lastT >= 500) {
                     fps = Math.round(frames * 1000 / (now - lastT));
                     frames = 0; lastT = now;
-                    stats.innerHTML = `fps: <b>${fps}</b><br>char: <b>"${dispChar}"</b><br>atlas: <b>${atlas.width}×${atlas.height}</b><br>spread: <b>${font.spread}px</b>`;
+                    stats.innerHTML =
+                        `fps: <b>${fps}</b><br>` +
+                        `dpr: <b>${dpr.toFixed(1)}x</b><br>` +
+                        `char: <b>"${dispChar}"</b><br>` +
+                        `backing: <b>${physW}×${physH}</b><br>` +
+                        `spread: <b>${font.spread}px</b>`;
                 }
 
                 requestAnimationFrame(render);
