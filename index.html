@@ -1,425 +1,557 @@
 <!DOCTYPE html>
 <html lang="ja">
+
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DSF v2 — MSDF Benchmark</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      background: #0a0a0f;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
-      overflow: hidden;
-    }
-
-    /* ─── Header ─────────────────────────────────────────── */
-    header {
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 14px 28px;
-      background: rgba(10, 10, 15, 0.72);
-      backdrop-filter: blur(16px);
-      border-bottom: 1px solid rgba(255,255,255,0.06);
-      z-index: 100;
-    }
-
-    .logo {
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-      color: #fff;
-    }
-    .logo span { color: #7c6fff; }
-
-    .badge {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: #7c6fff;
-      background: rgba(124,111,255,0.12);
-      border: 1px solid rgba(124,111,255,0.35);
-      border-radius: 20px;
-      padding: 4px 12px;
-    }
-
-    /* ─── Canvas wrapper ──────────────────────────────────── */
-    .canvas-wrap {
-      position: relative;
-      /* 1080×1920 → 9:16 → fill viewport height minus header  */
-      height: calc(100vh - 56px);
-      aspect-ratio: 9 / 16;
-      margin-top: 56px; /* header height */
-      box-shadow:
-        0 0 0 1px rgba(124,111,255,0.25),
-        0 0 60px 4px rgba(124,111,255,0.15),
-        0 32px 80px rgba(0,0,0,0.6);
-      border-radius: 3px;
-      overflow: hidden;
-    }
-
-    canvas {
-      display: block;
-      width: 100%;
-      height: 100%;
-    }
-
-    /* Corner marks */
-    .corner {
-      position: absolute;
-      width: 20px; height: 20px;
-      border-color: rgba(124,111,255,0.6);
-      border-style: solid;
-      border-width: 0;
-      pointer-events: none;
-    }
-    .corner.tl { top:0; left:0;  border-top-width:2px; border-left-width:2px; }
-    .corner.tr { top:0; right:0; border-top-width:2px; border-right-width:2px; }
-    .corner.bl { bottom:0; left:0;  border-bottom-width:2px; border-left-width:2px; }
-    .corner.br { bottom:0; right:0; border-bottom-width:2px; border-right-width:2px; }
-
-    /* ─── Stats overlay ───────────────────────────────────── */
-    #stats {
-      position: absolute;
-      bottom: 14px;
-      left: 14px;
-      font-size: 11px;
-      font-weight: 500;
-      letter-spacing: 0.06em;
-      color: rgba(255,255,255,0.55);
-      background: rgba(0,0,0,0.45);
-      backdrop-filter: blur(8px);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 8px;
-      padding: 8px 12px;
-      line-height: 1.8;
-      pointer-events: none;
-    }
-  </style>
-</head>
-<body>
-
-  <!-- ─── Header ──────────────────────────────────────────── -->
-  <header>
-    <div class="logo">DSF <span>v2</span></div>
-    <div class="badge">MSDF Benchmark · 1080 × 1920</div>
-  </header>
-
-  <!-- ─── Canvas ──────────────────────────────────────────── -->
-  <div class="canvas-wrap" id="canvasWrap">
-    <canvas id="glCanvas" width="1080" height="1920"></canvas>
-    <div class="corner tl"></div>
-    <div class="corner tr"></div>
-    <div class="corner bl"></div>
-    <div class="corner br"></div>
-    <div id="stats">fps: –<br>time: –<br>ring: –</div>
-  </div>
-
-  <!-- ─── Raw WebGL / MSDF Simulation ─────────────────────── -->
-  <script>
-  (function () {
-    'use strict';
-
-    /* ── 1. WebGL setup ────────────────────────────────────── */
-    const canvas = document.getElementById('glCanvas');
-    const gl = canvas.getContext('webgl', {
-      antialias: true,
-      alpha: false,
-      powerPreference: 'high-performance'
-    });
-    if (!gl) { alert('WebGL not supported'); return; }
-
-    /* ── 2. Shaders ────────────────────────────────────────── */
-    /*
-     * Vertex shader — full-screen quad via gl_VertexID trick
-     * (or classic attribute buffer).
-     */
-    const VS = `
-      attribute vec2 a_pos;
-      varying   vec2 v_uv;
-      void main() {
-        v_uv        = a_pos * 0.5 + 0.5;   // [0,1]
-        gl_Position = vec4(a_pos, 0.0, 1.0);
-      }
-    `;
-
-    /*
-     * Fragment shader — MSDF-style simulation.
-     *
-     * Classic MSDF decomposes a shape's SDF into three colour
-     * channels so that a median-of-three reconstruction removes
-     * pseudo-distance artefacts.  Here we simulate the visual
-     * signature of MSDF rendering: concentric ring patterns per
-     * channel (R / G / B offset by ±δ), combined with
-     * median-of-three anti-aliasing, and animated so the rings
-     * expand outward continuously.
-     *
-     * Pattern details
-     * ───────────────
-     * • The "SDF" of multiple overlapping ellipses / boxes is
-     *   summed to build a rich, continuously-changing distance
-     *   field (like a real MSDF atlas under animation).
-     * • Each of R, G, B samples the distance field at slightly
-     *   different radii → replicates the three-channel encoding.
-     * • A median(R,G,B) pass mirrors the MSDF decoder step.
-     * • Smooth ring bands + glow simulate the rendered glyphs.
-     */
-    const FS = `
-      precision highp float;
-      varying vec2  v_uv;
-
-      uniform float u_time;
-      uniform vec2  u_res;   /* canvas resolution in pixels */
-
-      /* ── helpers ─────────────────────────────────────────── */
-      float median3(float a, float b, float c) {
-        return max(min(a,b), min(max(a,b),c));
-      }
-
-      /* smooth step for anti-aliased edges */
-      float edge(float d, float w) {
-        return smoothstep(-w, w, d);
-      }
-
-      /* signed distance to an ellipse centred at p */
-      float sdEllipse(vec2 p, vec2 ab) {
-        p = abs(p);
-        if (p.x > p.y) { p = p.yx; ab = ab.yx; }
-        float l = ab.y * ab.y - ab.x * ab.x;
-        float m = ab.x * p.x / l;
-        float n = ab.y * p.y / l;
-        float m2 = m*m; float n2 = n*n;
-        float c = (m2+n2-1.0)/3.0;
-        float c3 = c*c*c;
-        float q = c3 + m2*n2*2.0;
-        float d = c3 + m2*n2;
-        float g = m + m*n2;
-        float co;
-        if (d < 0.0) {
-          float h = acos(q/c3)/3.0;
-          float s = cos(h);
-          float t = sin(h)*sqrt(3.0);
-          float rx = sqrt(-c*(s+t+2.0)+m2);
-          float ry = sqrt(-c*(s-t+2.0)+m2);
-          co = (ry + sign(l)*rx + abs(g)/(rx*ry) - m)/2.0;
-        } else {
-          float h = 2.0*m*n*sqrt(d);
-          float s = sign(q+h)*pow(abs(q+h),0.333);
-          float u2 = sign(q-h)*pow(abs(q-h),0.333);
-          float rx = -s - u2 - c*4.0 + 2.0*m2;
-          float ry = (s  - u2)*sqrt(3.0);
-          float rm = sqrt(rx*rx+ry*ry);
-          co = (ry/sqrt(rm-rx)+2.0*g/rm-m)/2.0;
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DSF v2 — MSDF Font Prototype</title>
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
         }
-        vec2 r = ab * vec2(co, sqrt(1.0-co*co));
-        return length(r-p) * sign(p.y-r.y);
-      }
 
-      /* signed distance to an oriented box */
-      float sdBox(vec2 p, vec2 b) {
-        vec2 d = abs(p) - b;
-        return length(max(d,0.0)) + min(max(d.x,d.y),0.0);
-      }
+        body {
+            background: #0a0a0f;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            overflow: hidden;
+        }
 
-      /* ── procedural MSDF distance field ──────────────────── */
-      float msdfField(vec2 uv, float ch_offset) {
-        /* map uv → "world" coords in [-1,1] range, aspect-correct */
-        float aspect = u_res.x / u_res.y;   /* ~0.5625 for 9:16 */
-        vec2 p = (uv - 0.5) * vec2(1.0, 1.0/aspect);  /* square domain */
+        header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 28px;
+            background: rgba(10, 10, 15, 0.72);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            z-index: 100;
+        }
 
-        float t = u_time * 0.28;
-        float d = 1e9;
+        .logo {
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: .18em;
+            text-transform: uppercase;
+            color: #fff;
+        }
 
-        /* ── ring 1: central pulsing ellipse ── */
-        vec2 p1 = p;
-        float a1 = t * 0.4;
-        p1 = vec2(p1.x*cos(a1)-p1.y*sin(a1),
-                  p1.x*sin(a1)+p1.y*cos(a1));
-        d = min(d, sdEllipse(p1, vec2(0.28 + ch_offset*0.012,
-                                      0.18 + ch_offset*0.008)));
+        .logo span {
+            color: #7c6fff;
+        }
 
-        /* ── ring 2: orbiting box ── */
-        float orb = t * 0.55;
-        vec2 centre2 = vec2(cos(orb)*0.22, sin(orb)*0.22);
-        vec2 p2 = p - centre2;
-        float a2 = t * 0.7 + ch_offset * 0.15;
-        p2 = vec2(p2.x*cos(a2)-p2.y*sin(a2),
-                  p2.x*sin(a2)+p2.y*cos(a2));
-        d = min(d, sdBox(p2, vec2(0.11 + ch_offset*0.009,
-                                  0.11 + ch_offset*0.007)));
+        .badge {
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            color: #7c6fff;
+            background: rgba(124, 111, 255, .12);
+            border: 1px solid rgba(124, 111, 255, .35);
+            border-radius: 20px;
+            padding: 4px 12px;
+        }
 
-        /* ── ring 3: counter-rotating ellipse ── */
-        float orb3 = -t * 0.38 + 2.094;
-        vec2 centre3 = vec2(cos(orb3)*0.30, sin(orb3)*0.30);
-        vec2 p3 = p - centre3;
-        float a3 = -t * 0.52 + ch_offset * 0.2;
-        p3 = vec2(p3.x*cos(a3)-p3.y*sin(a3),
-                  p3.x*sin(a3)+p3.y*cos(a3));
-        d = min(d, sdEllipse(p3, vec2(0.09 + ch_offset*0.007,
-                                      0.14 + ch_offset*0.009)));
+        .canvas-wrap {
+            position: relative;
+            height: calc(100vh - 56px);
+            aspect-ratio: 9/16;
+            margin-top: 56px;
+            box-shadow: 0 0 0 1px rgba(124, 111, 255, .25), 0 0 60px 4px rgba(124, 111, 255, .15), 0 32px 80px rgba(0, 0, 0, .6);
+            border-radius: 3px;
+            overflow: hidden;
+        }
 
-        /* ── ring 4: small fast orbiter ── */
-        float orb4 = t * 1.1 + 4.189;
-        vec2 centre4 = vec2(cos(orb4)*0.18, sin(orb4*1.3)*0.22);
-        vec2 p4 = p - centre4;
-        d = min(d, sdBox(p4, vec2(0.055 + ch_offset*0.005,
-                                  0.085 + ch_offset*0.005)));
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
 
-        /* ── ring 5: large slow background ellipse ── */
-        float a5 = t * 0.12;
-        vec2 p5 = vec2(p.x*cos(a5)-p.y*sin(a5),
-                       p.x*sin(a5)+p.y*cos(a5));
-        d = min(d, sdEllipse(p5, vec2(0.52 + ch_offset*0.014,
-                                      0.38 + ch_offset*0.010)));
+        .corner {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border-color: rgba(124, 111, 255, .6);
+            border-style: solid;
+            border-width: 0;
+            pointer-events: none;
+        }
 
-        return d;
-      }
+        .corner.tl {
+            top: 0;
+            left: 0;
+            border-top-width: 2px;
+            border-left-width: 2px;
+        }
 
-      /* ── expanding ring function ─────────────────────────── */
-      /*
-       * Converts a signed distance into an expanding-ring
-       * pattern — the visual hallmark of MSDF glyph atlases
-       * when seen with scrolling / zoom animation.
-       */
-      float rings(float d, float speed, float freq, float pw) {
-        /* band = repeating rings that travel outward */
-        float phase  = d * freq - u_time * speed;
-        float band   = 0.5 + 0.5 * sin(phase * 6.2832);
-        /* narrow the ring with a power curve */
-        band = pow(band, pw);
-        /* fade toward zero outside the shape boundary */
-        float mask   = 1.0 - smoothstep(-0.02, 0.06, d);
-        float glow   = exp(-max(d,0.0) * 14.0) * 0.6;
-        return band * (mask + 0.35) + glow;
-      }
+        .corner.tr {
+            top: 0;
+            right: 0;
+            border-top-width: 2px;
+            border-right-width: 2px;
+        }
 
-      void main() {
-        float px = 1.0 / u_res.y;   /* one pixel in uv space */
+        .corner.bl {
+            bottom: 0;
+            left: 0;
+            border-bottom-width: 2px;
+            border-left-width: 2px;
+        }
 
-        /* ── per-channel SDF (MSDF offset trick) ── */
-        float dR = msdfField(v_uv, -1.0);
-        float dG = msdfField(v_uv,  0.0);
-        float dB = msdfField(v_uv,  1.0);
+        .corner.br {
+            bottom: 0;
+            right: 0;
+            border-bottom-width: 2px;
+            border-right-width: 2px;
+        }
 
-        /* ── ring visuals per channel ── */
-        float r = rings(dR, 0.55, 3.2, 3.0);
-        float g = rings(dG, 0.52, 3.2, 3.0);
-        float b = rings(dB, 0.49, 3.2, 3.0);
+        #stats {
+            position: absolute;
+            bottom: 14px;
+            left: 14px;
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: .06em;
+            color: rgba(255, 255, 255, .55);
+            background: rgba(0, 0, 0, .45);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, .08);
+            border-radius: 8px;
+            padding: 8px 12px;
+            line-height: 1.8;
+            pointer-events: none;
+        }
 
-        /* ── MSDF median decode (anti-alias artefact removal) ── */
-        float med = median3(r, g, b);
+        #loading {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            background: rgba(10, 10, 15, .9);
+            color: rgba(255, 255, 255, .7);
+            font-size: 13px;
+            z-index: 10;
+        }
 
-        /* blend individual channels with median for MSDF look */
-        vec3 col = vec3(r, g, b);
-        col = mix(col, vec3(med), 0.45);
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 2px solid rgba(124, 111, 255, .2);
+            border-top-color: #7c6fff;
+            border-radius: 50%;
+            animation: spin .8s linear infinite;
+        }
 
-        /* ── colour grade ──────────────────────────────────── */
-        /* deep indigo base with chromatic ring separation */
-        vec3 palette_dark  = vec3(0.04, 0.03, 0.10);
-        vec3 palette_r     = vec3(0.95, 0.30, 0.55);
-        vec3 palette_g     = vec3(0.45, 0.82, 0.95);
-        vec3 palette_b     = vec3(0.62, 0.44, 1.00);
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
 
-        vec3 final = palette_dark
-          + palette_r * col.r * 0.7
-          + palette_g * col.g * 0.55
-          + palette_b * col.b * 0.75;
+<body>
+    <header>
+        <div class="logo">DSF <span>v2</span></div>
+        <div class="badge">MSDF Font Prototype · 1080 × 1920</div>
+    </header>
 
-        /* ── vignette ──────────────────────────────────────── */
-        float aspect = u_res.x / u_res.y;
-        vec2 vig_uv = (v_uv - 0.5) * vec2(aspect, 1.0);
-        float vig = 1.0 - dot(vig_uv, vig_uv) * 1.8;
-        final *= clamp(vig, 0.0, 1.0);
+    <div class="canvas-wrap" id="canvasWrap">
+        <canvas id="glCanvas" width="1080" height="1920"></canvas>
+        <div class="corner tl"></div>
+        <div class="corner tr"></div>
+        <div class="corner bl"></div>
+        <div class="corner br"></div>
+        <div id="stats">–</div>
+        <div id="loading">
+            <div class="spinner"></div><span id="loadMsg">Loading font data…</span>
+        </div>
+    </div>
 
-        /* ── subtle scanlines (CRT aesthetics for depth) ── */
-        float scan = 0.96 + 0.04 * sin(v_uv.y * u_res.y * 3.14159);
-        final *= scan;
+    <script>
+        'use strict';
 
-        gl_FragColor = vec4(final, 1.0);
-      }
-    `;
+        // ═══════════════════════════════════════════════════════════════
+        // WebGL helpers
+        // ═══════════════════════════════════════════════════════════════
+        const canvas = document.getElementById('glCanvas');
+        const gl = canvas.getContext('webgl', { antialias: true, alpha: false, powerPreference: 'high-performance' });
+        if (!gl) { alert('WebGL not supported'); }
 
-    /* ── 3. Compile & link ─────────────────────────────────── */
-    function compileShader(type, src) {
-      const sh = gl.createShader(type);
-      gl.shaderSource(sh, src);
-      gl.compileShader(sh);
-      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-        throw new Error('Shader error:\n' + gl.getShaderInfoLog(sh));
-      }
-      return sh;
-    }
+        // Enable OES_standard_derivatives for fwidth() anti-aliasing
+        const extDeriv = gl.getExtension('OES_standard_derivatives');
 
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compileShader(gl.VERTEX_SHADER,   VS));
-    gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, FS));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error('Link error:\n' + gl.getProgramInfoLog(prog));
-    }
-    gl.useProgram(prog);
+        function mkShader(type, src) {
+            const sh = gl.createShader(type);
+            gl.shaderSource(sh, src); gl.compileShader(sh);
+            if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+                throw new Error(gl.getShaderInfoLog(sh));
+            return sh;
+        }
+        function mkProg(vs, fs) {
+            const p = gl.createProgram();
+            gl.attachShader(p, mkShader(gl.VERTEX_SHADER, vs));
+            gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fs));
+            gl.linkProgram(p);
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+                throw new Error(gl.getProgramInfoLog(p));
+            return p;
+        }
 
-    /* ── 4. Full-screen quad geometry ─────────────────────── */
-    const vbo = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-    gl.bufferData(gl.ARRAY_BUFFER,
-      new Float32Array([-1,-1, 1,-1, -1,1, 1,1]),
-      gl.STATIC_DRAW);
+        // ═══════════════════════════════════════════════════════════════
+        // BACKGROUND — MSDF ring-expansion shader (benchmark)
+        // ═══════════════════════════════════════════════════════════════
+        const BG_VS = `
+  attribute vec2 a_pos;
+  varying   vec2 v_uv;
+  void main() { v_uv = a_pos * .5 + .5; gl_Position = vec4(a_pos, 0., 1.); }
+`;
+        const BG_FS = `
+  precision highp float;
+  varying vec2  v_uv;
+  uniform float u_time;
+  uniform vec2  u_res;
 
-    const aPos = gl.getAttribLocation(prog, 'a_pos');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  float median3(float a, float b, float c) { return max(min(a,b), min(max(a,b),c)); }
 
-    /* ── 5. Uniform locations ──────────────────────────────── */
-    const uTime = gl.getUniformLocation(prog, 'u_time');
-    const uRes  = gl.getUniformLocation(prog, 'u_res');
+  float sdEllipse(vec2 p, vec2 ab) {
+    p = abs(p); if (p.x > p.y) { p = p.yx; ab = ab.yx; }
+    float l = ab.y*ab.y - ab.x*ab.x, m = ab.x*p.x/l, n = ab.y*p.y/l;
+    float m2=m*m, n2=n*n, c=(m2+n2-1.)/3., c3=c*c*c;
+    float q=c3+m2*n2*2., d=c3+m2*n2, g=m+m*n2; float co;
+    if (d<0.) { float h=acos(q/c3)/3., s=cos(h), t=sin(h)*sqrt(3.);
+      float rx=sqrt(-c*(s+t+2.)+m2), ry=sqrt(-c*(s-t+2.)+m2);
+      co=(ry+sign(l)*rx+abs(g)/(rx*ry)-m)/2.; }
+    else { float h=2.*m*n*sqrt(d), s=sign(q+h)*pow(abs(q+h),.333), u2=sign(q-h)*pow(abs(q-h),.333);
+      float rx=-s-u2-c*4.+2.*m2, ry=(s-u2)*sqrt(3.), rm=sqrt(rx*rx+ry*ry);
+      co=(ry/sqrt(rm-rx)+2.*g/rm-m)/2.; }
+    vec2 r=ab*vec2(co,sqrt(1.-co*co));
+    return length(r-p)*sign(p.y-r.y);
+  }
+  float sdBox(vec2 p, vec2 b) { vec2 d=abs(p)-b; return length(max(d,0.))+min(max(d.x,d.y),0.); }
 
-    gl.uniform2f(uRes, canvas.width, canvas.height);
+  float msdfField(vec2 uv, float ch) {
+    float asp = u_res.x/u_res.y;
+    vec2 p = (uv-.5)*vec2(1.,1./asp);
+    float t = u_time*.28; float d = 1e9;
+    float a1=t*.4; vec2 p1=vec2(p.x*cos(a1)-p.y*sin(a1), p.x*sin(a1)+p.y*cos(a1));
+    d = min(d, sdEllipse(p1, vec2(.28+ch*.012,.18+ch*.008)));
+    float orb=t*.55; vec2 c2=vec2(cos(orb)*.22,sin(orb)*.22);
+    vec2 p2=p-c2; float a2=t*.7+ch*.15;
+    p2 = vec2(p2.x*cos(a2)-p2.y*sin(a2), p2.x*sin(a2)+p2.y*cos(a2));
+    d = min(d, sdBox(p2, vec2(.11+ch*.009,.11+ch*.007)));
+    float orb3=-t*.38+2.094; vec2 c3=vec2(cos(orb3)*.30,sin(orb3)*.30);
+    vec2 p3=p-c3; float a3=-t*.52+ch*.2;
+    p3 = vec2(p3.x*cos(a3)-p3.y*sin(a3), p3.x*sin(a3)+p3.y*cos(a3));
+    d = min(d, sdEllipse(p3, vec2(.09+ch*.007,.14+ch*.009)));
+    float orb4=t*1.1+4.189; vec2 c4=vec2(cos(orb4)*.18,sin(orb4*1.3)*.22);
+    d = min(d, sdBox(p-c4, vec2(.055+ch*.005,.085+ch*.005)));
+    float a5=t*.12; vec2 p5=vec2(p.x*cos(a5)-p.y*sin(a5), p.x*sin(a5)+p.y*cos(a5));
+    d = min(d, sdEllipse(p5, vec2(.52+ch*.014,.38+ch*.010)));
+    return d;
+  }
+  float rings(float d, float spd, float freq, float pw) {
+    float band = pow(.5+.5*sin((d*freq - u_time*spd)*6.2832), pw);
+    float mask = 1.-smoothstep(-.02,.06,d);
+    float glow = exp(-max(d,0.)*14.)*.6;
+    return band*(mask+.35)+glow;
+  }
+  void main() {
+    float dR=msdfField(v_uv,-1.),dG=msdfField(v_uv,0.),dB=msdfField(v_uv,1.);
+    float r=rings(dR,.55,3.2,3.),g=rings(dG,.52,3.2,3.),b=rings(dB,.49,3.2,3.);
+    float med=median3(r,g,b);
+    vec3 col=mix(vec3(r,g,b),vec3(med),.45);
+    vec3 dark=vec3(.04,.03,.10);
+    vec3 fin=dark+vec3(.95,.30,.55)*col.r*.45+vec3(.45,.82,.95)*col.g*.35+vec3(.62,.44,1.)*col.b*.5;
+    float asp=u_res.x/u_res.y;
+    vec2 vp=(v_uv-.5)*vec2(asp,1.); fin*=clamp(1.-dot(vp,vp)*1.8,0.,1.);
+    fin*=.96+.04*sin(v_uv.y*u_res.y*3.14159);
+    gl_FragColor=vec4(fin,1.);
+  }
+`;
 
-    /* ── 6. Stats / FPS counter ────────────────────────────── */
-    const stats   = document.getElementById('stats');
-    let   frames  = 0;
-    let   lastFPS = performance.now();
-    let   fps     = 0;
+        // ═══════════════════════════════════════════════════════════════
+        // GLYPH — MSDF character shader
+        // ═══════════════════════════════════════════════════════════════
+        const GLYPH_VS = `
+  attribute vec2 a_pos;
+  attribute vec2 a_uv;
+  varying   vec2 v_uv;
+  void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0., 1.); }
+`;
+        // Use #extension directive for OES_standard_derivatives
+        const GLYPH_FS = (extDeriv ? '#extension GL_OES_standard_derivatives : enable\n' : '') + `
+  precision highp float;
+  varying vec2      v_uv;
+  uniform sampler2D u_atlas;
+  uniform vec3      u_color;
+  uniform vec3      u_glow;
+  uniform float     u_time;
 
-    /* ── 7. Render loop ────────────────────────────────────── */
-    function render(now) {
-      const t = now * 0.001;   /* seconds */
+  float median(float r, float g, float b) { return max(min(r,g), min(max(r,g),b)); }
 
-      gl.viewport(0, 0, canvas.width, canvas.height);
-      gl.uniform1f(uTime, t);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  void main() {
+    vec3  msd  = texture2D(u_atlas, v_uv).rgb;
+    float sd   = median(msd.r, msd.g, msd.b);
 
-      /* fps */
-      frames++;
-      if (now - lastFPS >= 500) {
-        fps     = Math.round(frames * 1000 / (now - lastFPS));
-        frames  = 0;
-        lastFPS = now;
+    // Anti-aliased edge width
+    #ifdef GL_OES_standard_derivatives
+      float w = fwidth(sd) * .75;
+    #else
+      float w = 0.018;
+    #endif
 
-        /* ring count = how many full expansions have happened */
-        const rings = Math.floor(t * 0.52 * 3.2) % 99;
-        stats.innerHTML =
-          `fps: <b>${fps}</b><br>` +
-          `time: <b>${t.toFixed(1)}s</b><br>` +
-          `ring: <b>${rings}</b>`;
-      }
+    float alpha = smoothstep(.5 - w, .5 + w, sd);
 
-      requestAnimationFrame(render);
-    }
-    requestAnimationFrame(render);
+    // Outer glow halo
+    float halo = smoothstep(.30, .50, sd) * (1. - alpha) * .55;
 
-  })();
-  </script>
+    // Animated inner shimmer
+    float shimmer = .5 + .5 * sin(u_time * 2.1 + v_uv.x * 8.);
+    vec3  innerCol = mix(u_color, vec3(1.), shimmer * .25);
+
+    vec3  finalCol = mix(u_glow, innerCol, alpha);
+    float finalA   = alpha + halo;
+
+    gl_FragColor = vec4(finalCol * finalA, finalA);
+  }
+`;
+
+        // ═══════════════════════════════════════════════════════════════
+        // Euclidean Distance Transform  (8-SSED, two-pass)
+        // ═══════════════════════════════════════════════════════════════
+        function computeEDT(init, w, h) {
+            const d = new Float32Array(init);
+            const S2 = Math.SQRT2;
+            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+                const i = y * w + x;
+                if (y > 0) {
+                    if (x > 0) d[i] = Math.min(d[i], d[(y - 1) * w + (x - 1)] + S2);
+                    d[i] = Math.min(d[i], d[(y - 1) * w + x] + 1);
+                    if (x < w - 1) d[i] = Math.min(d[i], d[(y - 1) * w + (x + 1)] + S2);
+                }
+                if (x > 0) d[i] = Math.min(d[i], d[y * w + (x - 1)] + 1);
+            }
+            for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+                const i = y * w + x;
+                if (y < h - 1) {
+                    if (x < w - 1) d[i] = Math.min(d[i], d[(y + 1) * w + (x + 1)] + S2);
+                    d[i] = Math.min(d[i], d[(y + 1) * w + x] + 1);
+                    if (x > 0) d[i] = Math.min(d[i], d[(y + 1) * w + (x - 1)] + S2);
+                }
+                if (x < w - 1) d[i] = Math.min(d[i], d[y * w + (x + 1)] + 1);
+            }
+            return d;
+        }
+
+        // Build one SDF channel from a rendered glyph with pixel offset (ox, oy)
+        function buildChannel(char, fontSpec, W, H, spread, ox, oy) {
+            const c = Object.assign(document.createElement('canvas'), { width: W, height: H });
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+            ctx.fillStyle = '#fff'; ctx.font = fontSpec;
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText(char, W / 2 + ox, H / 2 + oy);
+
+            const px = ctx.getImageData(0, 0, W, H).data;
+            const n = W * H;
+            const d1 = new Float32Array(n), d0 = new Float32Array(n);
+            for (let i = 0; i < n; i++) {
+                const inside = px[i * 4] > 127;
+                d1[i] = inside ? 0 : 9999;
+                d0[i] = inside ? 9999 : 0;
+            }
+            // ed1: dist to nearest glyph pixel  (0 inside  → large outside)
+            // ed0: dist to nearest non-glyph px (0 outside → large inside)
+            const ed1 = computeEDT(d1, W, H);
+            const ed0 = computeEDT(d0, W, H);
+            const sdf = new Float32Array(n);
+            for (let i = 0; i < n; i++) {
+                // signed distance: negative inside, positive outside; normalised to [0,1]
+                sdf[i] = Math.max(0, Math.min(1, 0.5 - (ed0[i] - ed1[i]) / (spread * 2)));
+            }
+            return sdf;
+        }
+
+        // Generate full MSDF RGBA atlas
+        function generateMSDFAtlas(char, fontSpec, W, H, spread) {
+            const off = spread * 0.28;           // chromatic offset between channels
+            const sdfR = buildChannel(char, fontSpec, W, H, spread, +off, 0);
+            const sdfG = buildChannel(char, fontSpec, W, H, spread, 0, 0);
+            const sdfB = buildChannel(char, fontSpec, W, H, spread, -off, 0);
+
+            const rgba = new Uint8Array(W * H * 4);
+            for (let i = 0; i < W * H; i++) {
+                rgba[i * 4 + 0] = sdfR[i] * 255 | 0;
+                rgba[i * 4 + 1] = sdfG[i] * 255 | 0;
+                rgba[i * 4 + 2] = sdfB[i] * 255 | 0;
+                rgba[i * 4 + 3] = 255;
+            }
+            return rgba;
+        }
+
+        // Upload atlas → WebGL texture
+        function uploadTexture(rgba, W, H) {
+            const tex = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            return tex;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Build quad vertices  (clip-space pos + atlas UV)
+        // ═══════════════════════════════════════════════════════════════
+        function buildGlyphQuad(CW, CH, scale) {
+            // Glyph is rendered as a square occupying `scale` of canvas height
+            const glH = CH * scale;
+            const glW = glH;                       // square atlas → square quad
+            const lt = (CW - glW) / 2, tp = (CH - glH) / 2;
+            const rb = lt + glW, bt = tp + glH;
+
+            function cx(px) { return (px / CW) * 2 - 1; }
+            function cy(py) { return -(py / CH) * 2 + 1; }
+
+            // Triangle strip: TL TR BL BR
+            return new Float32Array([
+                cx(lt), cy(tp), 0, 0,
+                cx(rb), cy(tp), 1, 0,
+                cx(lt), cy(bt), 0, 1,
+                cx(rb), cy(bt), 1, 1,
+            ]);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Main async init
+        // ═══════════════════════════════════════════════════════════════
+        async function main() {
+            const loadMsg = document.getElementById('loadMsg');
+
+            // 1. Load JSON font data
+            loadMsg.textContent = 'Loading font data…';
+            const fontData = await fetch('assets/fonts/demo-msdf.json').then(r => r.json());
+            const { font, atlas, display } = fontData;
+            const dispChar = display.text || 'A';
+            const dispColor = display.color || [1, 1, 1];
+            const dispGlow = display.glowColor || [0.48, 0.43, 1.0];
+            const dispScale = display.scale || 0.42;
+
+            // 2. Generate MSDF atlas (CPU)
+            loadMsg.textContent = 'Generating MSDF atlas…';
+            await new Promise(r => setTimeout(r, 0));   // yield to browser to repaint spinner
+            const fontSpec = `bold ${font.size}px ${font.family}`;
+            const atlasRGBA = generateMSDFAtlas(dispChar, fontSpec, atlas.width, atlas.height, font.spread);
+
+            // 3. Upload texture
+            loadMsg.textContent = 'Uploading texture…';
+            const atlasTex = uploadTexture(atlasRGBA, atlas.width, atlas.height);
+
+            // ── Compile programs ──────────────────────────────────────
+            const bgProg = mkProg(BG_VS, BG_FS);
+            const glyphProg = mkProg(GLYPH_VS, GLYPH_FS);
+
+            // ── Background geometry ───────────────────────────────────
+            const bgVBO = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, bgVBO);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+            // ── Glyph geometry ────────────────────────────────────────
+            const glyphVBO = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, glyphVBO);
+            gl.bufferData(gl.ARRAY_BUFFER, buildGlyphQuad(1080, 1920, dispScale), gl.STATIC_DRAW);
+
+            // ── Uniform locations ─────────────────────────────────────
+            const bg = {
+                prog: bgProg,
+                aPos: gl.getAttribLocation(bgProg, 'a_pos'),
+                uTime: gl.getUniformLocation(bgProg, 'u_time'),
+                uRes: gl.getUniformLocation(bgProg, 'u_res'),
+            };
+            const gh = {
+                prog: glyphProg,
+                aPos: gl.getAttribLocation(glyphProg, 'a_pos'),
+                aUV: gl.getAttribLocation(glyphProg, 'a_uv'),
+                uAtlas: gl.getUniformLocation(glyphProg, 'u_atlas'),
+                uColor: gl.getUniformLocation(glyphProg, 'u_color'),
+                uGlow: gl.getUniformLocation(glyphProg, 'u_glow'),
+                uTime: gl.getUniformLocation(glyphProg, 'u_time'),
+            };
+
+            // Hide loading overlay
+            document.getElementById('loading').style.display = 'none';
+
+            // ── Render loop ───────────────────────────────────────────
+            let frames = 0, lastT = performance.now(), fps = 0;
+            const stats = document.getElementById('stats');
+
+            function render(now) {
+                const t = now * 0.001;
+                gl.viewport(0, 0, 1080, 1920);
+
+                // Pass 1: background rings
+                gl.disable(gl.BLEND);
+                gl.useProgram(bg.prog);
+                gl.bindBuffer(gl.ARRAY_BUFFER, bgVBO);
+                gl.enableVertexAttribArray(bg.aPos);
+                gl.vertexAttribPointer(bg.aPos, 2, gl.FLOAT, false, 0, 0);
+                gl.uniform1f(bg.uTime, t);
+                gl.uniform2f(bg.uRes, 1080, 1920);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                // Pass 2: MSDF character
+                gl.enable(gl.BLEND);
+                gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // premultiplied alpha
+                gl.useProgram(gh.prog);
+                gl.bindBuffer(gl.ARRAY_BUFFER, glyphVBO);
+                gl.enableVertexAttribArray(gh.aPos);
+                gl.vertexAttribPointer(gh.aPos, 2, gl.FLOAT, false, 4 * 4, 0);
+                gl.enableVertexAttribArray(gh.aUV);
+                gl.vertexAttribPointer(gh.aUV, 2, gl.FLOAT, false, 4 * 4, 2 * 4);
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+                gl.uniform1i(gh.uAtlas, 0);
+                gl.uniform3fv(gh.uColor, dispColor);
+                gl.uniform3fv(gh.uGlow, dispGlow);
+                gl.uniform1f(gh.uTime, t);
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                // Stats
+                frames++;
+                if (now - lastT >= 500) {
+                    fps = Math.round(frames * 1000 / (now - lastT));
+                    frames = 0; lastT = now;
+                    stats.innerHTML = `fps: <b>${fps}</b><br>char: <b>"${dispChar}"</b><br>atlas: <b>${atlas.width}×${atlas.height}</b><br>spread: <b>${font.spread}px</b>`;
+                }
+
+                requestAnimationFrame(render);
+            }
+            requestAnimationFrame(render);
+        }
+
+        main().catch(err => {
+            document.getElementById('loadMsg').textContent = '⚠ ' + err.message;
+            console.error(err);
+        });
+    </script>
 </body>
+
 </html>

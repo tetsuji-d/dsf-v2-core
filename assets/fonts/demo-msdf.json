@@ -1,0 +1,27 @@
+{
+  "_comment": "DSF v2 MSDF font metadata. Atlas PNG is generated procedurally at runtime.",
+  "font": {
+    "family": "Arial, sans-serif",
+    "size": 180,
+    "spread": 16
+  },
+  "atlas": {
+    "width": 256,
+    "height": 256,
+    "file": "demo-msdf.png"
+  },
+  "glyphs": [
+    {
+      "char": "A",
+      "unicode": 65,
+      "atlasBounds": { "left": 8, "top": 8, "right": 248, "bottom": 248 },
+      "advance": 1.0
+    }
+  ],
+  "display": {
+    "text": "A",
+    "color": [1.0, 1.0, 1.0],
+    "glowColor": [0.48, 0.43, 1.0],
+    "scale": 0.42
+  }
+}
