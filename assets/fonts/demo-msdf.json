@@ -1,27 +1,41 @@
 {
-  "_comment": "DSF v2 MSDF font metadata. Atlas PNG is generated procedurally at runtime.",
-  "font": {
-    "family": "Arial, sans-serif",
-    "size": 180,
-    "spread": 16
-  },
-  "atlas": {
-    "width": 256,
-    "height": 256,
-    "file": "demo-msdf.png"
-  },
-  "glyphs": [
-    {
-      "char": "A",
-      "unicode": 65,
-      "atlasBounds": { "left": 8, "top": 8, "right": 248, "bottom": 248 },
-      "advance": 1.0
+    "_comment": "DSF v2 MSDF font metadata. Atlas PNG is generated procedurally at runtime.",
+    "_changes": "spread 16→6 (reduces cross-edge interference in narrow spaces like 'A' crotch); atlas 256→512 (higher SDF resolution); font.size 180→380 (fills the larger atlas adequately)",
+    "font": {
+        "family": "Arial, sans-serif",
+        "size": 380,
+        "spread": 6
+    },
+    "atlas": {
+        "width": 512,
+        "height": 512,
+        "file": "demo-msdf.png"
+    },
+    "glyphs": [
+        {
+            "char": "A",
+            "unicode": 65,
+            "atlasBounds": {
+                "left": 16,
+                "top": 16,
+                "right": 496,
+                "bottom": 496
+            },
+            "advance": 1.0
+        }
+    ],
+    "display": {
+        "text": "A",
+        "color": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "glowColor": [
+            0.48,
+            0.43,
+            1.0
+        ],
+        "scale": 0.42
     }
-  ],
-  "display": {
-    "text": "A",
-    "color": [1.0, 1.0, 1.0],
-    "glowColor": [0.48, 0.43, 1.0],
-    "scale": 0.42
-  }
 }

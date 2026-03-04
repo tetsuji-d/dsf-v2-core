@@ -353,7 +353,11 @@
             const n = W * H;
             const d1 = new Float32Array(n), d0 = new Float32Array(n);
             for (let i = 0; i < n; i++) {
-                const inside = px[i * 4] > 127;
+                // Threshold 200 (not 127) to treat Canvas2D anti-aliased edge pixels
+                // as OUTSIDE.  Canvas2D smooths text edges, so pixels with alpha
+                // 128-199 are "soft edge" — including them as inside causes the EDT
+                // to misplace the edge at sharp corners (like the crotch of 'A').
+                const inside = px[i * 4] > 200;
                 d1[i] = inside ? 0 : 9999;
                 d0[i] = inside ? 9999 : 0;
             }
@@ -363,18 +367,37 @@
             const ed0 = computeEDT(d0, W, H);
             const sdf = new Float32Array(n);
             for (let i = 0; i < n; i++) {
-                // signed distance: negative inside, positive outside; normalised to [0,1]
                 sdf[i] = Math.max(0, Math.min(1, 0.5 - (ed0[i] - ed1[i]) / (spread * 2)));
             }
             return sdf;
         }
 
+        // ───────────────────────────────────────────────────────────────
         // Generate full MSDF RGBA atlas
+        // ───────────────────────────────────────────────────────────────
+        // Corner-artifact fix: instead of shifting all channels horizontally
+        // (which creates fighting gradients at sharp corners like the bottom of 'A'),
+        // we use THREE DIRECTIONS 120° apart — simulating msdfgen's edge-color assignment.
+        //
+        // R → 0°   (right)          B→\ /←G
+        // G → 120° (lower-left)         R→
+        // B → 240° (upper-left)     (equidistant ⇒ minimal corner cancellation)
+        //
+        // At any sharp corner the three channels sample from different approach
+        // directions, so at least two will agree on the correct distance.
+        // The Chlumský median-of-three decode then picks the safe value.
         function generateMSDFAtlas(char, fontSpec, W, H, spread) {
-            const off = spread * 0.28;           // chromatic offset between channels
-            const sdfR = buildChannel(char, fontSpec, W, H, spread, +off, 0);
-            const sdfG = buildChannel(char, fontSpec, W, H, spread, 0, 0);
-            const sdfB = buildChannel(char, fontSpec, W, H, spread, -off, 0);
+            const off = spread * 0.32;  // offset magnitude: ~32% of spread (in atlas px)
+            // Angles: 0°, 120°, 240°
+            const A0 = 0;
+            const A1 = Math.PI * 2 / 3;
+            const A2 = Math.PI * 4 / 3;
+            const sdfR = buildChannel(char, fontSpec, W, H, spread,
+                Math.cos(A0) * off, Math.sin(A0) * off);
+            const sdfG = buildChannel(char, fontSpec, W, H, spread,
+                Math.cos(A1) * off, Math.sin(A1) * off);
+            const sdfB = buildChannel(char, fontSpec, W, H, spread,
+                Math.cos(A2) * off, Math.sin(A2) * off);
 
             const rgba = new Uint8Array(W * H * 4);
             for (let i = 0; i < W * H; i++) {
